@@ -315,8 +315,13 @@ func loadSettings(path string) ControllerConf {
 
 // UI functions
 func printAbout() {
-    fmt.Println("cocleman - Compact CLustEr MANager - v0.4")
-    fmt.Println("(C) 2014-2015 tny. internet media // dangerously-bad-code department")
+    fmt.Println("")
+    fmt.Println("     __      (((.)))")
+    fmt.Println("    |__) __   __|         PicoRed ~ version 0.4")
+    fmt.Println("  _ |\\  /__\\ /  |         Distributed Server Redundancy Manager")
+    fmt.Println(" /_)| \\ \\__  \\__|         (C) 2015 tny. internet media")
+    fmt.Println("/                                  http://i.tny.im")
+    fmt.Println("")
 }
 
 func scanToSlice() []string {
@@ -397,7 +402,7 @@ func evaluateLogWritingCommand(cmd []string) {
     tlog := cmd[1]
     path := ""
     if len(cmd) < 3 {
-        path = "/tmp/cocleman-" + tlog
+        path = "/tmp/picored-" + tlog
     } else {
         path = cmd[2]
     }
