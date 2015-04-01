@@ -228,7 +228,7 @@ func thisNodeReachable(m *memberlist.Memberlist) bool {
     r := m.Members()
     if len(r) < 2 {
         // we're alone in the cluster, check with a 3rd party
-        resp, err := http.Get("http://httpbin.org/status/200")
+        resp, err := http.Get(cset.ConnectionCheckURL)
         if err != nil {
             return false
         }
@@ -297,6 +297,7 @@ type ControllerConf struct {
     HandlersScript string
     StatsdAddress string
     PeriodicRejoinInterval int
+    ConnectionCheckURL string
 }
 
 func loadSettings(path string) ControllerConf {
@@ -309,6 +310,9 @@ func loadSettings(path string) ControllerConf {
     err = decoder.Decode(&settings)
     if err != nil {
         clog.Fatal("Could not decode settings from ", path)
+    }
+    if settings.ConnectionCheckURL == "" {
+        settings.ConnectionCheckURL = "http://httpbin.org/status/200"
     }
     return settings
 }
