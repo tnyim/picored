@@ -197,7 +197,7 @@ func (d DelegateImplement) MergeRemoteState(buf []byte, join bool) {
 
 // end of DelegateImplement
 
-func joinCluster(m *memberlist.Memberlist, initial bool) {
+func joinCluster(m *memberlist.Memberlist, initial bool, periodic bool) {
     n, err := m.Join(cset.InitialNodes)
     if err != nil {
         if(initial) {
@@ -210,7 +210,9 @@ func joinCluster(m *memberlist.Memberlist, initial bool) {
             }
         }
     } else {
-        clog.Printf("Joined cluster (number of nodes: %d)", n)
+        if !periodic {
+            clog.Printf("Joined cluster (number of nodes: %d)", n)
+        }
     }
 }
 
@@ -450,7 +452,7 @@ func evaluateCommand(m *memberlist.Memberlist, cmd []string, remote *memberlist.
             break
         case "rejoin":
             clog.Println("Performing manual cluster rejoin...")
-            joinCluster(m, false)
+            joinCluster(m, false, false)
             break
         case "help":
             fmt.Println("Accepted commands: version, nicequit, ragequit, nodes, mllog, writelog [ml|ctrl] [filepath], clearlog [ml|ctrl], appstate [app|*] [ok|ng|auto|clear], remote [peer name] [command], reachable, rejoin")
@@ -623,8 +625,7 @@ func periodicRejoin(m *memberlist.Memberlist) {
     }
     for {
         time.Sleep(time.Duration(cset.PeriodicRejoinInterval) * time.Second)
-        clog.Println("Performing periodic cluster rejoin...")
-        joinCluster(m, false)
+        joinCluster(m, false, true)
     }
 }
 
@@ -689,7 +690,7 @@ func main() {
     publishControllerState(m, "Initializing")
 
     clog.Println("Attempting initial cluster join...")
-    joinCluster(m, true)
+    joinCluster(m, true, false)
     go consoleManager(m)
     go periodicRejoin(m)
     if cset.StatsdAddress != "" {
