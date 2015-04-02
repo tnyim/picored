@@ -22,33 +22,43 @@ import(
 )
 
 var(
+    VERSION = "0.4"
     localnode *memberlist.Node
     ml_pointer *memberlist.Memberlist
     node_meta = NodeMetadata{}
     memberlistLog = new(bytes.Buffer)
     clog = log.New(LoggerWrapper{}, "", log.Ldate | log.Ltime)
     controllerLog = new(bytes.Buffer)
-    monitorapp = true
-    app_bad_check_count = 0
     NetTimeout int
     pong_received = false
     cset ControllerConf
+    applications map[string]Application
     initialized = false
     mostRecentlyJoinedNodeName string
 )
 
-func ApplicationGoneDownHandler(ip string) {
-    clog.Println("Application on node with IP address", ip, "gone down.")
-    cmd := exec.Command(cset.HandlersScript, ip, "down")
+type Application struct {
+    Monitor bool
+    CheckURL string
+    ExpectedReply string
+    CheckInterval int
+    BadCheckCount int
+    Tolerance int
+    LastCheck time.Time
+}
+
+func ApplicationGoneDownHandler(appname string, ip string) {
+    clog.Println("Application", appname, "on node with IP address", ip, "gone down.")
+    cmd := exec.Command(cset.HandlersScript, appname, ip, "down")
     err := cmd.Run()
     if err != nil {
         clog.Println("Could not execute handler on script:", err)
     }
 }
 
-func ApplicationGoneUpHandler(ip string) {
-    clog.Println("Application on node with IP address", ip, "gone up.")
-    cmd := exec.Command(cset.HandlersScript, ip, "up")
+func ApplicationGoneUpHandler(appname string, ip string) {
+    clog.Println("Application", appname, "on node with IP address", ip, "gone up.")
+    cmd := exec.Command(cset.HandlersScript, appname, ip, "up")
     err := cmd.Run()
     if err != nil {
         clog.Println("Could not execute handler on script:", err)
@@ -61,9 +71,14 @@ type RemoteMessage struct {
     Contents []string
 }
 
+type ApplicationState struct {
+    State string
+    MonitorState string
+}
+
 type NodeMetadata struct {
     ControllerState string
-    ApplicationState string
+    ApplicationStates map[string]ApplicationState
 }
 func decodeNodeMeta(n *memberlist.Node) NodeMetadata {
     buffer := new(bytes.Buffer)
@@ -76,9 +91,16 @@ func decodeNodeMeta(n *memberlist.Node) NodeMetadata {
     }
     return remote_meta
 }
+func appStatesToString(s map[string]ApplicationState) string {
+    o := ""
+    for key := range s {
+        o += fmt.Sprintf("                       %s - %s (%s)\n", key, s[key].State, s[key].MonitorState)
+    }
+    return o
+}
 func nodeMetaToString(n *memberlist.Node) string {
     remote_meta := decodeNodeMeta(n)
-    return fmt.Sprintf("                    Controller state: %s\n                    Application state: %s", remote_meta.ControllerState, remote_meta.ApplicationState)
+    return fmt.Sprintf("                    Controller state: %s\n                    Application states:\n%s", remote_meta.ControllerState, appStatesToString(remote_meta.ApplicationStates))
 }
 type EventHandler struct {
 }
@@ -103,8 +125,10 @@ func (e EventHandler) NotifyLeave(n *memberlist.Node) {
         clog.Printf("%s\n%s", blue("Node %s%s left nicely.", n.Name, selfstring), nodeMetaToString(n))
     } else {
         clog.Printf("%s\n%s", red("Node %s%s left.", n.Name, selfstring), nodeMetaToString(n))
-        if decodeNodeMeta(n).ApplicationState == "ok" {
-            ApplicationGoneDownHandler(n.Addr.String())
+        for name, state := range decodeNodeMeta(n).ApplicationStates {
+            if state.State == "ok" {
+                ApplicationGoneDownHandler(name, n.Addr.String())
+            }
         }
     }
 }
@@ -255,16 +279,40 @@ func publishControllerState(m *memberlist.Memberlist, state string) {
     node_meta.ControllerState = state
 }
 
-func publishApplicationState(m *memberlist.Memberlist, state string) {
-    if node_meta.ApplicationState != state {
-        if state == "ok" && thisNodeReachable(m) {
-            ApplicationGoneUpHandler(m.LocalNode().Addr.String())
-        } else if state == "ng" {
-            ApplicationGoneDownHandler(m.LocalNode().Addr.String())
+func publishApplicationState(m *memberlist.Memberlist, appname string, state string) {
+    _, present := node_meta.ApplicationStates[appname]
+    if present {
+        if node_meta.ApplicationStates[appname].State != state {
+            as := node_meta.ApplicationStates[appname]
+            as.State = state
+            node_meta.ApplicationStates[appname] = as
+            if state == "ok" && thisNodeReachable(m) {
+                ApplicationGoneUpHandler(appname, m.LocalNode().Addr.String())
+            } else if state == "ng" {
+                ApplicationGoneDownHandler(appname, m.LocalNode().Addr.String())
+            }
+            defer publishControllerMetadata(m)
         }
+    } else {
+        if(node_meta.ApplicationStates == nil) {
+            node_meta.ApplicationStates = make(map[string]ApplicationState)
+        }
+        node_meta.ApplicationStates[appname] = ApplicationState{State: state, MonitorState: "Monitoring"}
         defer publishControllerMetadata(m)
     }
-    node_meta.ApplicationState = state
+}
+
+func publishApplicationMonitorState(m *memberlist.Memberlist, appname string, state string) {
+    _, present := node_meta.ApplicationStates[appname]
+    if present {
+        as := node_meta.ApplicationStates[appname]
+        as.MonitorState = state
+        node_meta.ApplicationStates[appname] = as
+    } else {
+        node_meta.ApplicationStates[appname] = ApplicationState{State: "", MonitorState: state}
+
+    }
+    defer publishControllerMetadata(m)
 }
 
 func publishControllerMetadata(m *memberlist.Memberlist) {
@@ -283,16 +331,20 @@ func (l LoggerWrapper) Write(p []byte) (n int, err error) {
 
 // Controller Settings loading
 
+type ApplicationConf struct {
+    CheckURL string
+    ExpectedReply string
+    Tolerance int
+    CheckInterval int
+}
+
 type ControllerConf struct {
     NodeName     string
     BindAddr     string
     BindPort     int
     InitialNodes []string
     NetTimeout int
-    AppCheckURL string
-    AppExpectedReply string
-    AppTolerance int
-    AppCheckInterval int
+    Applications map[string]ApplicationConf
     EncryptionKey string
     HandlersScript string
     StatsdAddress string
@@ -314,6 +366,15 @@ func loadSettings(path string) ControllerConf {
     if settings.ConnectionCheckURL == "" {
         settings.ConnectionCheckURL = "http://httpbin.org/status/200"
     }
+    applications = make(map[string]Application)
+    for key, app := range settings.Applications {
+        applications[key] = Application{CheckURL: app.CheckURL,
+                            CheckInterval: app.CheckInterval,
+                            ExpectedReply: app.ExpectedReply,
+                            Tolerance: app.Tolerance,
+                            Monitor: true,
+                            BadCheckCount:0}
+    }
     return settings
 }
 
@@ -321,7 +382,7 @@ func loadSettings(path string) ControllerConf {
 func printAbout() {
     fmt.Println("")
     fmt.Println("     __      (((.)))")
-    fmt.Println("    |__) __   __|         PicoRed ~ version 0.4")
+    fmt.Println("    |__) __   __|         PicoRed ~ version " + VERSION)
     fmt.Println("  _ |\\  /__\\ /  |         Distributed Server Redundancy Manager")
     fmt.Println(" /_)| \\ \\__  \\__|         (C) 2015 tny. internet media")
     fmt.Println("/                                  http://i.tny.im")
@@ -392,7 +453,7 @@ func evaluateCommand(m *memberlist.Memberlist, cmd []string, remote *memberlist.
             joinCluster(m, false)
             break
         case "help":
-            fmt.Println("Accepted commands: version, nicequit, ragequit, nodes, mllog, writelog [ml|ctrl] [filepath], clearlog [ml|ctrl], appstate [ok|ng|auto|clear], remote [peer name] [command], reachable, rejoin")
+            fmt.Println("Accepted commands: version, nicequit, ragequit, nodes, mllog, writelog [ml|ctrl] [filepath], clearlog [ml|ctrl], appstate [app|*] [ok|ng|auto|clear], remote [peer name] [command], reachable, rejoin")
         default:
             fmt.Println("Unknown command. Issue \"help\" for a list of accepted commands.")
             break
@@ -447,35 +508,45 @@ func evaluateLogClearingCommand(cmd []string) {
 }
 
 func evaluateAppStatusCommand(m *memberlist.Memberlist, cmd []string) {
-    if len(cmd) < 2 {
+    if len(cmd) < 3 {
         fmt.Println("appstate: invalid argument.")
         return
     }
-    switch cmd[1] {
-        case "ok":
-            monitorapp = false
-            publishControllerState(m, "ApplicationStateForced")
-            publishApplicationState(m, "ok")
-            clog.Println("appstate: application status forced as OK. Will not monitor application on this node.")
-            break
-        case "ng":
-            monitorapp = false
-            publishControllerState(m, "ApplicationStateForced")
-            publishApplicationState(m, "ng")
-            clog.Println("appstate: application status forced as not-good. Will not monitor application on this node.")
-            break   
-        case "auto":
-            monitorapp = true
-            publishControllerState(m, "Monitoring")
-            clog.Println("appstate: controller set to monitor application on this node.")
-            break
-        case "clear":
-            if node_meta.ApplicationState != "ApplicationStateForced" {
-                publishApplicationState(m, "")
+    for key, app := range applications {
+        if(key == cmd[1] || cmd[1] == "*") {
+            switch cmd[2] {
+                case "ok":
+                    a := applications[key]
+                    a.Monitor = false
+                    applications[key] = a
+                    publishApplicationMonitorState(m, key, "ApplicationStateForced")
+                    publishApplicationState(m, key, "ok")
+                    clog.Println("appstate: status of application", key, "forced as OK. Will not monitor application on this node.")
+                    break
+                case "ng":
+                    a := applications[key]
+                    a.Monitor = false
+                    applications[key] = a
+                    publishApplicationMonitorState(m, key, "ApplicationStateForced")
+                    publishApplicationState(m, key, "ng")
+                    clog.Println("appstate: status of application", key, "forced as not-good. Will not monitor application on this node.")
+                    break   
+                case "auto":
+                    a := applications[key]
+                    a.Monitor = true
+                    applications[key] = a
+                    publishApplicationMonitorState(m, key, "Monitoring")
+                    clog.Println("appstate: controller set to monitor application", key, "on this node.")
+                    break
+                case "clear":
+                    if app.Monitor {
+                        publishApplicationState(m, key, "")
+                    }
+                default:
+                    fmt.Println("appstate: invalid argument.")
+                    break
             }
-        default:
-            fmt.Println("appstate: invalid argument.")
-            break
+        }
     }
 }
 
@@ -509,34 +580,40 @@ func performNiceLeave(m *memberlist.Memberlist) {
     m.Shutdown()
 }
 
-func checkApplication(m *memberlist.Memberlist, cset *ControllerConf) {
-    resp, err := http.Get(cset.AppCheckURL)
-    if err != nil {
-        app_bad_check_count++
-        if(app_bad_check_count == cset.AppTolerance) {
-            publishApplicationState(m, "ng")
+func checkApplications(m *memberlist.Memberlist) {
+    for key, app := range applications {
+        if app.Monitor && time.Since(app.LastCheck) > time.Duration(app.CheckInterval) * time.Second {
+            app.LastCheck = time.Now()
+            resp, err := http.Get(app.CheckURL)
+            if err != nil {
+                app.BadCheckCount++
+                if(app.BadCheckCount == app.Tolerance) {
+                    publishApplicationState(m, key, "ng")
+                }
+                return
+            }
+            defer resp.Body.Close()
+
+            body, err := ioutil.ReadAll(resp.Body)
+            if string(body) != app.ExpectedReply {
+                app.BadCheckCount++
+                if(app.BadCheckCount == app.Tolerance) {
+                    publishApplicationState(m, key, "ng")
+                }
+                return
+            }
+            // Application is ok only if this node is reachable by at least one another
+            if thisNodeReachable(m) == false {
+                app.BadCheckCount++
+                if(app.BadCheckCount == app.Tolerance) {
+                    publishApplicationState(m, key, "ng")
+                }
+                return
+            }
+            publishApplicationState(m, key, "ok")
+            app.BadCheckCount = 0
         }
-        return
     }
-    defer resp.Body.Close()
-    body, err := ioutil.ReadAll(resp.Body)
-    if string(body) != cset.AppExpectedReply {
-        app_bad_check_count++
-        if(app_bad_check_count == cset.AppTolerance) {
-            publishApplicationState(m, "ng")
-        }
-        return
-    }
-    // Application is ok only if this node is reachable by at least one another
-    if thisNodeReachable(m) == false {
-        app_bad_check_count++
-        if(app_bad_check_count == cset.AppTolerance) {
-            publishApplicationState(m, "ng")
-        }
-        return
-    }
-    publishApplicationState(m, "ok")
-    app_bad_check_count = 0
 }
 
 func periodicRejoin(m *memberlist.Memberlist) {
@@ -622,15 +699,13 @@ func main() {
         clog.Println("Statsd address empty; sstdCollector not started.")
     }
     initialized = true
-    publishControllerState(m, "Monitoring")
+    publishControllerState(m, "Ready")
     for {
         if len(mostRecentlyJoinedNodeName) > 0 {
-            sendRemoteCommand(m, []string{"remote", mostRecentlyJoinedNodeName, "appstate", "clear"})
+            sendRemoteCommand(m, []string{"remote", mostRecentlyJoinedNodeName, "appstate", "*", "clear"})
             mostRecentlyJoinedNodeName = ""
         }
-        if(monitorapp) {
-            checkApplication(m, &cset)
-        }
-        time.Sleep(time.Duration(cset.AppCheckInterval)*time.Second)
+        checkApplications(m)
+        time.Sleep(1*time.Second)
     }
 }
