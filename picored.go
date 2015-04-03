@@ -582,38 +582,51 @@ func performNiceLeave(m *memberlist.Memberlist) {
     m.Shutdown()
 }
 
+func checkApplication(m *memberlist.Memberlist, key string) {
+    resp, err := http.Get(applications[key].CheckURL)
+    if err != nil {
+        a := applications[key]
+        a.BadCheckCount++ 
+        applications[key] = a
+        if(a.BadCheckCount == a.Tolerance) {
+            publishApplicationState(m, key, "ng")
+        }
+        return
+    }
+    defer resp.Body.Close()
+
+    body, err := ioutil.ReadAll(resp.Body)
+    if string(body) != applications[key].ExpectedReply {
+        a := applications[key]
+        a.BadCheckCount++
+        applications[key] = a
+        if(a.BadCheckCount == a.Tolerance) {
+            publishApplicationState(m, key, "ng")
+        }
+        return
+    }
+    // Application is ok only if this node is reachable by at least one another
+    if thisNodeReachable(m) == false {
+        a := applications[key]
+        a.BadCheckCount++
+        applications[key] = a
+        if(a.BadCheckCount == a.Tolerance) {
+            publishApplicationState(m, key, "ng")
+        }
+        return
+    }
+    publishApplicationState(m, key, "ok")
+    a := applications[key]
+    a.BadCheckCount = 0
+    applications[key] = a
+}
 func checkApplications(m *memberlist.Memberlist) {
     for key, app := range applications {
         if app.Monitor && time.Since(app.LastCheck) > time.Duration(app.CheckInterval) * time.Second {
-            app.LastCheck = time.Now()
-            resp, err := http.Get(app.CheckURL)
-            if err != nil {
-                app.BadCheckCount++
-                if(app.BadCheckCount == app.Tolerance) {
-                    publishApplicationState(m, key, "ng")
-                }
-                return
-            }
-            defer resp.Body.Close()
-
-            body, err := ioutil.ReadAll(resp.Body)
-            if string(body) != app.ExpectedReply {
-                app.BadCheckCount++
-                if(app.BadCheckCount == app.Tolerance) {
-                    publishApplicationState(m, key, "ng")
-                }
-                return
-            }
-            // Application is ok only if this node is reachable by at least one another
-            if thisNodeReachable(m) == false {
-                app.BadCheckCount++
-                if(app.BadCheckCount == app.Tolerance) {
-                    publishApplicationState(m, key, "ng")
-                }
-                return
-            }
-            publishApplicationState(m, key, "ok")
-            app.BadCheckCount = 0
+            a := applications[key]
+            a.LastCheck = time.Now()
+            applications[key] = a
+            go checkApplication(m, key)
         }
     }
 }
